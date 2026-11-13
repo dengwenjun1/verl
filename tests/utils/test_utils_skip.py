@@ -21,6 +21,7 @@ import json
 import shutil
 import uuid
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
@@ -31,9 +32,10 @@ from omegaconf import OmegaConf
 from verl.protocol import DataProto
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.skip.base_skip import SKIP_REGISTRY, BaseSkip, SkipAction, register_skip
-from verl.utils.skip.config import AsyncRolloutSkipConfig, RolloutSkipConfig, SkipManagerConfig
+from verl.utils.skip.config import AsyncRolloutSkipConfig, RolloutSkipConfig, SkipManagerConfig, TrainingSkipConfig
 from verl.utils.skip.rollout_skip import AsyncRolloutSkip, RolloutSkip, parse_async_rollout_sample_step
 from verl.utils.skip.skip_manager import SkipManager
+from verl.utils.skip.training_skip import get_training_skip_metrics
 
 
 def _noop(*_args: Any, **_kwargs: Any) -> None:
@@ -490,6 +492,151 @@ class TestSkipManagerConfigDataclass:
         assert isinstance(c.rollout, RolloutSkipConfig)
         assert isinstance(c.async_rollout, AsyncRolloutSkipConfig)
         assert c.rollout.enable is False
+
+
+class TestTrainingSkip:
+    @pytest.mark.parametrize(
+        "role, batch_type, enable, steps, step, expected_calls",
+        [
+            # Step selection is shared by both roles and batch types.
+            pytest.param("updates", "dataproto", False, None, 1, 1, id="disabled"),
+            pytest.param("updates", "dataproto", True, None, -1, 1, id="uninitialized-step"),
+            pytest.param("updates", "dataproto", True, None, 0, 1, id="zero-step"),
+            pytest.param("updates", "dataproto", True, None, 1, 0, id="all-steps"),
+            pytest.param("updates", "dataproto", True, [], 1, 1, id="no-steps"),
+            pytest.param("updates", "dataproto", True, [2], 1, 1, id="unselected-step"),
+            pytest.param("updates", "dataproto", True, [2], 2, 0, id="selected-step"),
+            # Representative skips cover the remaining role/batch combinations.
+            pytest.param("updates", "queue", True, [2], 2, 0, id="updates-queue"),
+            pytest.param("train_compute", "dataproto", True, [2], 2, 0, id="compute-dataproto"),
+            pytest.param("train_compute", "queue", True, [2], 2, 0, id="compute-queue"),
+        ],
+    )
+    def test_selected_steps_preserve_batch(self, tmp_path, role, enable, steps, step, expected_calls, batch_type):
+        cfg = _minimal_skip_cfg(str(tmp_path), enable=False)
+        cfg.skip[role] = {"enable": enable, "steps": steps}
+        SkipManager.init(cfg)
+        SkipManager.set_step(step)
+        batch = (
+            DataProto.from_dict(tensors={"x": torch.ones(1)})
+            if batch_type == "dataproto"
+            else SimpleNamespace(partition_id="train", keys=["sample"], tags=[{"global_steps": step}])
+        )
+        calls = []
+
+        @SkipManager.annotate(role=role)
+        def work(trainer, batch, metrics):
+            calls.append(step)
+            metrics["loss"] = 1.0
+            return batch
+
+        metrics = {}
+        assert work(None, batch=batch, metrics=metrics) is batch
+        assert len(calls) == expected_calls
+        assert metrics == ({"loss": 1.0} if expected_calls else {})
+
+    @pytest.mark.parametrize("batch_type", ["dataproto", "queue"])
+    def test_validation_runs_original_function(self, tmp_path, batch_type):
+        cfg = _minimal_skip_cfg(str(tmp_path), enable=False)
+        cfg.skip.train_compute = {"enable": True}
+        SkipManager.init(cfg)
+        SkipManager.set_step(1)
+        batch = (
+            DataProto(meta_info={"validate": True})
+            if batch_type == "dataproto"
+            else SimpleNamespace(partition_id="val")
+        )
+        calls = []
+
+        @SkipManager.annotate(role="train_compute")
+        def work(trainer, batch):
+            calls.append(batch)
+            return batch
+
+        assert work(None, batch=batch) is batch
+        assert calls == [batch]
+
+    def test_independent_steps_and_nested_training_stages(self, tmp_path):
+        cfg = _minimal_skip_cfg(str(tmp_path), enable=False)
+        cfg.skip.updates = {"enable": True, "steps": [2]}
+        cfg.skip.train_compute = {"enable": True, "steps": [3]}
+        SkipManager.init(cfg)
+        assert SkipManager.skip_instances["updates"] is not SkipManager.skip_instances["train_compute"]
+        calls = []
+
+        class Trainer:
+            @SkipManager.annotate(role="updates")
+            def update(self, batch):
+                calls.append("update")
+                return batch
+
+            @SkipManager.annotate(role="train_compute")
+            def train(self, batch):
+                calls.append("compute")
+                return self.update(batch)
+
+        batch = DataProto.from_dict(tensors={"x": torch.ones(1)})
+        trainer = Trainer()
+        for step, expected in [(1, ["compute", "update"]), (2, ["compute"]), (3, []), (4, ["compute", "update"])]:
+            SkipManager.set_step(step)
+            calls.clear()
+            assert trainer.train(batch) is batch
+            assert calls == expected
+        assert list(tmp_path.iterdir()) == []
+
+    @pytest.mark.parametrize(
+        "step, expected_updates, expected_compute",
+        [(-1, 0, 0), (1, 0, 0), (2, 1, 0), (3, 1, 1), (4, 0, 0)],
+        ids=["uninitialized", "unselected", "updates-only", "compute-includes-updates", "later-unselected"],
+    )
+    def test_skip_metrics_use_requested_step(self, step, expected_updates, expected_compute):
+        config = OmegaConf.create(
+            {"updates": {"enable": True, "steps": [2]}, "train_compute": {"enable": True, "steps": [3]}}
+        )
+        # Delayed metrics must not depend on the manager's current step.
+        SkipManager.set_step(99)
+        expected = {
+            "training/skip_updates": expected_updates,
+            "training/skip_train_compute": expected_compute,
+        }
+        assert get_training_skip_metrics(config, step) == expected
+        assert get_training_skip_metrics(omega_conf_to_dataclass(config, SkipManagerConfig), step) == expected
+
+    @pytest.mark.parametrize("steps, expected_skip", [(None, 1), ([], 0)], ids=["all-steps", "no-steps"])
+    def test_skip_metrics_with_all_or_no_steps(self, steps, expected_skip):
+        config = SkipManagerConfig(train_compute=TrainingSkipConfig(enable=True, steps=steps))
+        assert get_training_skip_metrics(config, 1) == {
+            "training/skip_updates": expected_skip,
+            "training/skip_train_compute": expected_skip,
+        }
+
+    def test_reinitialization_disables_both_roles(self, tmp_path):
+        cfg = _minimal_skip_cfg(str(tmp_path), enable=False)
+        cfg.skip.updates = {"enable": True}
+        cfg.skip.train_compute = {"enable": True}
+        SkipManager.init(cfg)
+        SkipManager.init(_minimal_skip_cfg(str(tmp_path), enable=False))
+        assert not SkipManager.skip_instances["updates"].is_enabled()
+        assert not SkipManager.skip_instances["train_compute"].is_enabled()
+
+    def test_missing_or_disabled_config_has_no_skip_metrics(self):
+        assert get_training_skip_metrics(None, 1) == {}
+        assert get_training_skip_metrics(OmegaConf.create({}), 1) == {}
+        assert get_training_skip_metrics(SkipManagerConfig(), 1) == {}
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [{"enable": 1}, {"action": "cache"}, {"steps": [0]}, {"steps": [-1]}, {"steps": [True]}, {"steps": [1.5]}],
+    )
+    def test_invalid_config(self, kwargs):
+        with pytest.raises(ValueError):
+            TrainingSkipConfig(**kwargs)
+
+    def test_role_configs_are_independent(self):
+        config = SkipManagerConfig(updates=TrainingSkipConfig(enable=True))
+        assert config.updates is not config.train_compute
+        assert not config.train_compute.enable
+        assert "train" not in SKIP_REGISTRY
 
 
 class TestSkipManagerRuntimeScenarios:

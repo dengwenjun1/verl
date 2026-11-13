@@ -983,6 +983,14 @@ global_profiler:
       strict: false
 skip:
   _target_: verl.utils.skip.SkipManagerConfig
+  updates:
+    enable: false
+    steps: null
+    action: empty
+  train_compute:
+    enable: false
+    steps: null
+    action: empty
   rollout:
     enable: false
     dump_dir: ~/.verl/rollout_dump

@@ -1,7 +1,7 @@
 SkipManager: Skip everything in the RL pipeline.
 ===========
 
-Last updated: 2026-07-08
+Last updated: 2026-11-12
 
 .. contents:: :local:
    :depth: 1
@@ -18,8 +18,8 @@ Skip behavior is centralized under the top-level Hydra key ``skip``. Modules reg
 (for example ``"rollout"``, ``"rollout_tq"``, or ``"async_rollout"``) and are attached with
 @SkipManager.annotate(role=...) (or ``@SkipManager.annotate_tq(role=..., phase=...)`` for the
 V1 two-phase path). Each role declares which integer **steps** in config are eligible for skip
-logic. **Today only rollout-related roles are implemented**; the same mechanism can be extended to
-other pipeline stages (see section 6).
+logic. Rollout roles replay cached generation results; the ``updates`` and ``train_compute`` roles bypass training
+work while retaining real generation and the surrounding trainer lifecycle.
 
 Typical use cases
 ~~~~~~~~~~~~~~~~~
@@ -47,15 +47,74 @@ Supported entry points today
      - Skip role / config
      - Status
    * - ``main_ppo.py`` with trainer.use_v1=False (``RayPPOTrainer``)
-     - ``skip.rollout``
+     - ``skip.rollout``, ``skip.updates``, ``skip.train_compute``
      - **Supported**
    * - main_ppo.py with trainer.use_v1=True (V1 PPOTrainer + TransferQueue)
-     - ``skip.rollout_tq
-     - **Supported** (see section 4)
-   * - ``fully_async_main`` (``FullyAsyncRollouter``)
+     - ``skip.rollout_tq``, ``skip.updates``, ``skip.train_compute``
+     - **Supported** in all three V1 modes (see section 4)
+   * - ``fully_async_main`` (``FullyAsyncRollouter`` + ``FullyAsyncTrainer``)
      - ``skip.async_rollout``
-     - **Supported**
+     - **Rollout skip only**; training skip is not supported
 
+
+Training skip for inference debugging
+------------------------------------
+
+``skip.updates`` and ``skip.train_compute`` are independent roles alongside ``skip.rollout``.
+They support V0 and all three V1 modes. ``fully_async_main`` does not integrate training skip.
+Models and workers are still initialized normally. Keep the rollout skip roles disabled to retain
+real generation.
+
+.. code-block:: yaml
+
+   skip:
+     updates:
+       enable: true
+       steps: [2, 3]
+       action: empty
+     train_compute:
+       enable: true
+       steps: [4]
+       action: empty
+
+- ``updates`` skips the complete actor/critic update calls, including training forward/backward
+  passes, optimizer steps, and scheduler steps. Training input computation remains.
+- ``train_compute`` skips training batch balancing, old/reference log probabilities, critic values,
+  advantages/returns, training reward shaping, rollout correction, and the updates inside that
+  computation. Reward evaluation and sampler filtering still run; rollout-side log probabilities
+  are unaffected. Updates are bypassed even if ``skip.updates.enable=false``, because their inputs
+  have not been computed.
+- Each role has its own ``enable`` (default ``false``) and ``steps``. ``steps=null`` selects all
+  training steps; ``steps=[]`` selects none; ``steps=[2,3]`` selects only steps 2 and 3. Steps are
+  positive **trainer global steps**, including after checkpoint resume. In V1, all mini-batches
+  within the selected ``parameter_sync_step`` cycle are skipped. Rollout roles still require
+  explicit step lists.
+- ``action=empty`` is the only supported action: return the input batch without caching or
+  fabricating training results. Both roles share ``TrainingSkipConfig`` and the ``TrainingSkip``
+  implementation, but ``SkipManager`` creates a separate instance for each role.
+
+In the example, step 1 trains normally, steps 2 and 3 compute training inputs without updating
+models, and step 4 bypasses all training computation and updates. The roles preserve rollout,
+reward evaluation, queue handling, async warmup, worker sleep/wake, weight synchronization,
+validation/checkpoint cadence, and step progression. Trainer steps and synchronization still
+advance without optimizer updates.
+
+Append these overrides to an existing training command to skip all training computation on two steps:
+
+.. code-block:: bash
+
+   skip.train_compute.enable=True \
+   'skip.train_compute.steps=[2,3]'
+
+Use ``skip.updates.enable=True`` to skip only updates, or set either role's ``steps=null`` to
+select all trainer steps. These keys replace the previous ``skip.train.enable`` / ``scope`` /
+``steps`` configuration; ``skip.train`` is no longer accepted.
+
+When either role is enabled, the existing metric logger includes ``training/skip_updates`` and
+``training/skip_train_compute``. The former is true when either role skips updates; the latter
+tracks only ``train_compute``. All V1 mini-batches within a trainer step share the same selection.
+Skipped stages do not fabricate loss or gradient metrics; ``train_compute`` metrics do not require
+absent advantages, returns, or values.
 
 2. Configuration (``skip.rollout`` / ``skip.rollout_tq`` / ``skip.async_rollout``)
 ---------------------------------------------------------------------
@@ -531,6 +590,14 @@ Intercepted functions
      - Decorated function
      - Defined in
      - Step source
+   * - ``updates``
+     - ``_update_train_batch``
+     - V0 ``ray_trainer.py`` / V1 ``trainer_base.py``
+     - Trainer ``global_steps``
+   * - ``train_compute``
+     - ``_train_batch``
+     - V0 ``ray_trainer.py`` / V1 ``trainer_base.py``
+     - Trainer ``global_steps``
    * - ``rollout``
      - ``AgentLoopManager.generate_sequences``
      - ``verl/experimental/agent_loop/agent_loop.py``

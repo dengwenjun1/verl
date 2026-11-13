@@ -91,7 +91,7 @@ class SkipManager:
                         step = skip_instance.extract_step(*args, **kwargs_inner)
                     else:
                         step = cls.step
-                    if step not in skip_instance.steps:
+                    if skip_instance.steps is not None and step not in skip_instance.steps:
                         return await func(*args, **kwargs_inner)
                     if skip_instance.meet_precondition(step, func, *args, **kwargs_inner):
                         return skip_instance.warp_function(step, func, *args, **kwargs_inner)
@@ -112,7 +112,7 @@ class SkipManager:
                     step = skip_instance.extract_step(*args, **kwargs_inner)
                 else:
                     step = cls.step
-                if step not in skip_instance.steps:
+                if skip_instance.steps is not None and step not in skip_instance.steps:
                     return func(*args, **kwargs_inner)
                 if skip_instance.meet_precondition(step, func, *args, **kwargs_inner):
                     return skip_instance.warp_function(step, func, *args, **kwargs_inner)
